@@ -546,6 +546,7 @@ class ModelOptFp4Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
@@ -555,6 +556,9 @@ class ModelOptFp4Config(QuantizationConfig):
             return ModelOptFp4LinearMethod(self)
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
+        elif isinstance(layer, FlashInferFP4MoE):
+            # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+            return ModelOptNvFp4FusedMoEMethod(self)
         elif isinstance(layer, FusedMoE):
             return ModelOptNvFp4FusedMoEMethod(self)
         return None
@@ -887,6 +891,112 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             else swizzled_scale.reshape(B, M, K)
         )
 
+    def prepare_static_weights_for_kernel(
+        self,
+        # args_dequant,
+        # args,
+        gemm1_weights,
+        gemm2_weights,
+        gemm1_scales_linear_fp4_bytes,
+        gemm2_scales_linear_fp4_bytes,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+    ):
+        from flashinfer import (
+            RoutingMethodType,
+            e2m1_and_ufp8sf_scale_to_float,
+            fp4_quantize,
+            next_positive_power_of_2,
+            reorder_rows_for_gated_act_gemm,
+            shuffle_matrix_a,
+            shuffle_matrix_sf_a,
+        )
+        """Prepare quantized weights for kernel (done offline with weights)."""
+        epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+
+        # Convert quantized weights to proper formats
+        gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
+            num_experts, 2 * intermediate_size, hidden_size // 2
+        )  # packed fp4
+        gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+            torch.float8_e4m3fn
+        ).reshape(
+            num_experts, 2 * intermediate_size, hidden_size // 16
+        )  # fp8 scaling factors
+
+        gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
+            num_experts, hidden_size, intermediate_size // 2
+        )  # packed fp4
+        gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+            torch.float8_e4m3fn
+        ).reshape(
+            num_experts, hidden_size, intermediate_size // 16
+        )  # fp8 scaling factors
+
+        # Reorder rows of W1 and scales for fused gated activation
+        gemm1_weights_fp4_interleaved = []
+        gemm1_scales_fp4_interleaved = []
+        for i in range(num_experts):
+            gemm1_weights_fp4_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone())
+            )
+            gemm1_scales_fp4_interleaved.append(
+                reorder_rows_for_gated_act_gemm(gemm1_scales_linear_fp4[i].clone())
+            )
+
+        # Stack weights and scales for all experts
+        gemm1_weights_fp4_interleaved = torch.stack(
+            gemm1_weights_fp4_interleaved
+        ).reshape(num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_scales_fp4_interleaved = torch.stack(
+            gemm1_scales_fp4_interleaved
+        ).reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+
+        # Shuffle weights and scaling factors for transposed mma output
+        gemm1_weights_fp4_shuffled = []
+        gemm1_scales_fp4_shuffled = []
+        gemm2_weights_fp4_shuffled = []
+        gemm2_scales_fp4_shuffled = []
+        for i in range(num_experts):
+            gemm1_weights_fp4_shuffled.append(
+                shuffle_matrix_a(
+                    gemm1_weights_fp4_interleaved[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+            gemm1_scales_fp4_shuffled.append(
+                shuffle_matrix_sf_a(
+                    gemm1_scales_fp4_interleaved[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+
+            gemm2_weights_fp4_shuffled.append(
+                shuffle_matrix_a(
+                    gemm2_weights_fp4[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+            gemm2_scales_fp4_shuffled.append(
+                shuffle_matrix_sf_a(
+                    gemm2_scales_linear_fp4[i].view(torch.uint8), epilogue_tile_m
+                )
+            )
+
+        # Stack weights for all experts
+        gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+        gemm1_scales_fp4_shuffled = (
+            torch.stack(gemm1_scales_fp4_shuffled)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+        )
+
+        gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+        gemm2_scales_fp4_shuffled = (
+            torch.stack(gemm2_scales_fp4_shuffled)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, hidden_size, intermediate_size // 16)
+        )
+        return gemm1_weights_fp4_shuffled, gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled, gemm2_scales_fp4_shuffled
+        
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # GEMM 1
@@ -917,66 +1027,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale.dtype == torch.float8_e4m3fn
         ), "Weight Blockscale must be represented as FP8-E4M3"
         
-        # Process w13 weights and scales using flashinfer
-        if (self.enable_flashinfer_trtllm_moe and 
-            reorder_rows_for_gated_act_gemm is not None and 
-            shuffle_matrix_sf_a is not None):
-            # Process each expert's weights and scales
-            processed_w13_weights = []
-            processed_w13_scales = []
-            
-            for expert_idx in range(layer.local_num_experts):
-                # Get weight and scale for this expert
-                expert_weight = layer.w13_weight.data[expert_idx]  # (2*intermediate, hidden//2)
-                expert_scale = layer.w13_weight_scale.data[expert_idx]  # (2*intermediate, hidden//16)
-                
-                # Apply reordering for gated activation
-                reordered_weight = reorder_rows_for_gated_act_gemm(expert_weight.clone())
-                reordered_scale = reorder_rows_for_gated_act_gemm(expert_scale.clone())
-                
-                # Apply shuffling for better kernel performance
-                # Using epilogue_tile_m = 128 for FP4
-                shuffled_weight = shuffle_matrix_a(reordered_weight.view(torch.uint8), epilogue_tile_m=128)
-                shuffled_scale = shuffle_matrix_sf_a(
-                    reordered_scale.view(torch.uint8), 
-                    epilogue_tile_m=128
-                )
-                
-                processed_w13_weights.append(shuffled_weight.view(torch.uint8))
-                processed_w13_scales.append(shuffled_scale.view(torch.float8_e4m3fn))
-            
-            # Stack processed weights and scales
-            layer.w13_weight = Parameter(
-                torch.stack(processed_w13_weights), requires_grad=False
-            )
-            layer.w13_blockscale_swizzled = Parameter(
-                torch.stack(processed_w13_scales), requires_grad=False
-            )
-            
-            # Store in FP4 shuffled format for TRTLLM kernel (replaces runtime preparation)
-            layer.w13_weight_fp4_shuffled = layer.w13_weight
-            # Reshape to exact format expected by TRTLLM kernel (following temp_test_trtllmgen.py)
-            hidden_size = layer.w13_weight.shape[2] * 2  # Unpack FP4 dimension
-            layer.w13_scale_fp4_shuffled = layer.w13_blockscale_swizzled.view(torch.float8_e4m3fn).reshape(
-                layer.local_num_experts, 2 * layer.intermediate_size_per_partition, hidden_size // 16
-            )
-            
-            print("Applied flashinfer weight processing for w13")
-        else:
-            # Fallback to swizzle_blockscale if flashinfer functions not available (CUTLASS path)
-            w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
-            layer.w13_blockscale_swizzled = Parameter(
-                w13_blockscale_swizzled, requires_grad=False
-            )
-            layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-            print("Applied fallback weight processing for w13 (CUTLASS path)")
-
         # This is for quantization, so we need to invert it.
         layer.w13_input_scale_quant = Parameter(
             (1 / w13_input_scale).to(torch.float32), requires_grad=False
         )
-
-        # GEMM 2
+        
+        # GEMM 2 processing - moved here to be available for flashinfer block
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         else:
@@ -991,77 +1047,89 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale_quant = Parameter(
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
-
-        # Additional scale factor for TRTLLM-style kernels (used by FlashInfer FP4 MoE)
-        if self.enable_flashinfer_trtllm_moe:
+        
+        # Process w13 weights and scales using flashinfer
+        if (self.enable_flashinfer_trtllm_moe and 
+            reorder_rows_for_gated_act_gemm is not None and 
+            shuffle_matrix_sf_a is not None):
+            gemm1_weights_fp4_shuffled, \
+                gemm1_scales_fp4_shuffled, \
+                    gemm2_weights_fp4_shuffled, \
+                        gemm2_scales_fp4_shuffled = self.prepare_static_weights_for_kernel(
+                            layer.w13_weight, layer.w2_weight,
+                            layer.w13_weight_scale, layer.w2_weight_scale,
+                            layer.w2_weight.size(-2),  # hidden_size
+                            layer.w13_weight.size(-2) // 2,  # intermediate_size
+                            layer.w13_weight.size(0),  # num_experts
+                        )
+                        
+            layer.gemm1_weights_fp4_shuffled = Parameter(gemm1_weights_fp4_shuffled,
+                                                requires_grad=False)
+            layer.gemm2_weights_fp4_shuffled = Parameter(gemm2_weights_fp4_shuffled,
+                                                requires_grad=False)
+            layer.gemm1_scales_fp4_shuffled = Parameter(gemm1_scales_fp4_shuffled,
+                                            requires_grad=False)
+            layer.gemm2_scales_fp4_shuffled = Parameter(gemm2_scales_fp4_shuffled,
+                                            requires_grad=False)
+            
+            # Additional parameter needed for TRT-LLM
             layer.g1_scale_c = Parameter(
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
-
-        assert (
-            layer.w2_weight_scale.shape[2] % 16 == 0
-        ), "Expected weight_scale.dim(1) to be divisible by 16"
-        assert (
-            layer.w2_weight_scale.dtype == torch.float8_e4m3fn
-        ), "Weight Blockscale must be represented as FP8-E4M3"
-        
-        # Process w2 weights and scales using flashinfer
-        if (self.enable_flashinfer_trtllm_moe and 
-            shuffle_matrix_a is not None and 
-            shuffle_matrix_sf_a is not None):
-            # Process each expert's weights and scales
-            processed_w2_weights = []
-            processed_w2_scales = []
             
-            for expert_idx in range(layer.local_num_experts):
-                # Get weight and scale for this expert
-                expert_weight = layer.w2_weight.data[expert_idx]  # (hidden, intermediate//2)
-                expert_scale = layer.w2_weight_scale.data[expert_idx]  # (hidden, intermediate//16)
-                
-                # Apply shuffling for better kernel performance
-                shuffled_weight = shuffle_matrix_a(expert_weight.view(torch.uint8), epilogue_tile_m=128)
-                shuffled_scale = shuffle_matrix_sf_a(
-                    expert_scale.view(torch.uint8), 
-                    epilogue_tile_m=128
-                )
-                
-                processed_w2_weights.append(shuffled_weight.view(torch.uint8))
-                processed_w2_scales.append(shuffled_scale.view(torch.float8_e4m3fn))
+            # Clean up weights that won't be used by TRT-LLM
+            del layer.w2_weight
+            del layer.w2_weight_scale
+            del layer.w13_weight
+            del layer.w13_weight_scale
             
-            # Stack processed weights and scales
-            layer.w2_weight = Parameter(
-                torch.stack(processed_w2_weights), requires_grad=False
-            )
-            layer.w2_blockscale_swizzled = Parameter(
-                torch.stack(processed_w2_scales), requires_grad=False
-            )
-            
-            # Store in FP4 shuffled format for TRTLLM kernel (replaces runtime preparation)
-            layer.w2_weight_fp4_shuffled = layer.w2_weight
-            # Reshape to exact format expected by TRTLLM kernel (following temp_test_trtllmgen.py)
-            layer.w2_scale_fp4_shuffled = layer.w2_blockscale_swizzled.view(torch.float8_e4m3fn).reshape(
-                layer.local_num_experts, layer.w2_weight.shape[1], layer.intermediate_size_per_partition // 16
-            )
-            
-            print("Applied flashinfer weight processing for w2")
+            print("Applied flashinfer weight processing for both w13 and w2 (TRTLLM)")
+            flashinfer_trtllm_processed = True
         else:
             # Fallback to swizzle_blockscale if flashinfer functions not available (CUTLASS path)
+            w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            layer.w13_blockscale_swizzled = Parameter(
+                w13_blockscale_swizzled, requires_grad=False
+            )
+            layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+            print("Applied fallback weight processing for w13 (CUTLASS path)")
+            flashinfer_trtllm_processed = False
+
+        # Only process w2 separately if it wasn't already processed by flashinfer TRTLLM
+        if not flashinfer_trtllm_processed:
+            assert (
+                layer.w2_weight_scale.shape[2] % 16 == 0
+            ), "Expected weight_scale.dim(1) to be divisible by 16"
+            assert (
+                layer.w2_weight_scale.dtype == torch.float8_e4m3fn
+            ), "Weight Blockscale must be represented as FP8-E4M3"
+            
+            # Process w2 weights and scales - always use swizzle_blockscale for CUTLASS
+            # (The flashinfer CUTLASS path for w2 still needs the same swizzled format)
             w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
             layer.w2_blockscale_swizzled = Parameter(
                 w2_blockscale_swizzled, requires_grad=False
             )
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
-            print("Applied fallback weight processing for w2 (CUTLASS path)")
+            
+            if (self.enable_flashinfer_cutlass_moe and 
+                shuffle_matrix_a is not None and 
+                shuffle_matrix_sf_a is not None):
+                print("Applied flashinfer weight processing for w2 (CUTLASS)")
+            else:
+                print("Applied fallback weight processing for w2 (CUTLASS path)")
 
-        device = layer.w13_weight.device
-        layer.cutlass_moe_params = CutlassMoEParams(
-            CutlassMoEType.BlockscaledFP4,
-            device,
-            num_experts=layer.num_experts,  # global num experts
-            intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
-            hidden_size=layer.w13_weight.shape[2] * 2,
-        )  # k
+        # Only set CUTLASS MoE params if we haven't processed with flashinfer TRTLLM
+        if not flashinfer_trtllm_processed:
+            device = layer.w13_weight.device
+            layer.cutlass_moe_params = CutlassMoEParams(
+                CutlassMoEType.BlockscaledFP4,
+                device,
+                num_experts=layer.num_experts,  # global num experts
+                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
+                hidden_size=layer.w13_weight.shape[2] * 2,
+            )  # k
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -1085,6 +1153,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         tp_size: Optional[int] = None,
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
+        
+        # Check if this is a FlashInferFP4MoE layer that should handle its own forward
+        if hasattr(layer, 'gemm1_weights_fp4_shuffled'):
+            # This layer was processed with flashinfer TRTLLM - delegate to its own forward
+            return layer.forward(x, topk_output)
 
         if self.enable_flashinfer_cutlass_moe:
             assert (

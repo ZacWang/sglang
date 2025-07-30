@@ -795,7 +795,7 @@ class FlashInferFP4MoE(FusedMoE):
 
         # Calculate tile_tokens_dim based on current batch
         num_tokens = hidden_states.shape[0]
-        tile_tokens_dim = _get_tile_tokens_dim(num_tokens, top_k, self.num_experts)
+        tile_tokens_dim = _get_tile_tokens_dim(num_tokens, top_k, self.num_local_experts)
 
         # Debug prints for trtllm_fp4_block_scale_moe arguments (with rank info)
         rank = get_tensor_model_parallel_rank()
@@ -820,22 +820,22 @@ class FlashInferFP4MoE(FusedMoE):
         print(f"RANK {rank} hs_scale_linear: shape={hs_scale_fp8.shape}, dtype={hs_scale_fp8.dtype}")
         print(f"RANK {rank}   values: [{hs_scale_flat[:3].tolist()}...{hs_scale_flat[-3:].tolist()}]")
         
-        w13_flat = self.w13_weight_fp4_shuffled.flatten()
-        print(f"RANK {rank} w13_weight_fp4_shuffled: shape={self.w13_weight_fp4_shuffled.shape}, dtype={self.w13_weight_fp4_shuffled.dtype}")
+        w13_flat = self.gemm1_weights_fp4_shuffled.flatten()
+        print(f"RANK {rank} gemm1_weights_fp4_shuffled: shape={self.gemm1_weights_fp4_shuffled.shape}, dtype={self.gemm1_weights_fp4_shuffled.dtype}")
         print(f"RANK {rank}   values: [{w13_flat[:3].tolist()}...{w13_flat[-3:].tolist()}]")
         
-        w13_scale_fp8 = self.w13_scale_fp4_shuffled.view(torch.float8_e4m3fn)
+        w13_scale_fp8 = self.gemm1_scales_fp4_shuffled.view(torch.float8_e4m3fn)
         w13_scale_flat = w13_scale_fp8.flatten()
-        print(f"RANK {rank} w13_scale_fp4_shuffled: shape={w13_scale_fp8.shape}, dtype={w13_scale_fp8.dtype}")
+        print(f"RANK {rank} gemm1_scales_fp4_shuffled: shape={w13_scale_fp8.shape}, dtype={w13_scale_fp8.dtype}")
         print(f"RANK {rank}   values: [{w13_scale_flat[:3].tolist()}...{w13_scale_flat[-3:].tolist()}]")
         
-        w2_flat = self.w2_weight_fp4_shuffled.flatten()
-        print(f"RANK {rank} w2_weight_fp4_shuffled: shape={self.w2_weight_fp4_shuffled.shape}, dtype={self.w2_weight_fp4_shuffled.dtype}")
+        w2_flat = self.gemm2_weights_fp4_shuffled.flatten()
+        print(f"RANK {rank} gemm2_weights_fp4_shuffled: shape={self.gemm2_weights_fp4_shuffled.shape}, dtype={self.gemm2_weights_fp4_shuffled.dtype}")
         print(f"RANK {rank}   values: [{w2_flat[:3].tolist()}...{w2_flat[-3:].tolist()}]")
         
-        w2_scale_fp8 = self.w2_scale_fp4_shuffled.view(torch.float8_e4m3fn)
+        w2_scale_fp8 = self.gemm2_scales_fp4_shuffled.view(torch.float8_e4m3fn)
         w2_scale_flat = w2_scale_fp8.flatten()
-        print(f"RANK {rank} w2_scale_fp4_shuffled: shape={w2_scale_fp8.shape}, dtype={w2_scale_fp8.dtype}")
+        print(f"RANK {rank} gemm2_scales_fp4_shuffled: shape={w2_scale_fp8.shape}, dtype={w2_scale_fp8.dtype}")
         print(f"RANK {rank}   values: [{w2_scale_flat[:3].tolist()}...{w2_scale_flat[-3:].tolist()}]")
         
         scale_c_fc1_flat = scale_c_fc1.data.flatten()
@@ -855,7 +855,7 @@ class FlashInferFP4MoE(FusedMoE):
         print(f"RANK {rank} num_expert_group: {num_expert_group}")
         print(f"RANK {rank} topk_group: {topk_group}")
         print(f"RANK {rank} intermediate_size: {self.intermediate_size_per_partition}")
-        print(f"RANK {rank} local_expert_offset: 0")
+        print(f"RANK {rank} local_expert_offset: {self.ep_rank * self.num_local_experts}")
         print(f"RANK {rank} local_num_experts: {self.num_local_experts}")
         print(f"RANK {rank} routed_scaling_factor: {routed_scaling_factor}")
         print(f"RANK {rank} tile_tokens_dim: {tile_tokens_dim}")
@@ -863,31 +863,31 @@ class FlashInferFP4MoE(FusedMoE):
         print(f"RANK {rank} do_finalize: True")
         print(f"RANK {rank} ===============================================")
 
-        # Call FP4 TRTLLM kernel with proper DeepSeek parameters
+        # Call FP4 TRTLLM kernel with proper DeepSeek parameters - unified naming convention
         result = trtllm_fp4_block_scale_moe(
-            router_logits.to(torch.float32),  # routing_logits
-            correction_bias.to(hidden_states.dtype),  # routing_bias
-            hs_fp4,  # hidden_states (FP4)
-            hs_scale_linear.view(torch.float8_e4m3fn),  # hidden_states_scale
-            self.w13_weight_fp4_shuffled,  # gemm1_weights
-            self.w13_scale_fp4_shuffled.view(torch.float8_e4m3fn),   # gemm1_scales
-            self.w2_weight_fp4_shuffled,   # gemm2_weights
-            self.w2_scale_fp4_shuffled.view(torch.float8_e4m3fn),    # gemm2_scales
-            scale_c_fc1.data,     # scale_c_fc1
-            scale_gate_fc1.data,  # scale_gate_fc1
-            scale_c_fc2.data,     # scale_c_fc2
-            self.num_experts,         # num_experts
-            top_k,                   # top_k
-            num_expert_group,        # n_groups
-            topk_group,              # topk_group
-            self.intermediate_size_per_partition,  # intermediate_size
-            0,                       # local_expert_offset
-            self.num_local_experts,  # local_num_experts
-            routed_scaling_factor,   # routed_scaling_factor
-            tile_tokens_dim,         # tile_tokens_dim
-            RoutingMethodType.DeepSeekV3,  # routing_method_type (DeepSeek)
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=correction_bias.to(hidden_states.dtype),
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+            gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
+            gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(torch.float8_e4m3fn),
+            gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
+            gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(torch.float8_e4m3fn),
+            output1_scale_scalar=scale_c_fc1.data,
+            output1_scale_gate_scalar=scale_gate_fc1.data,
+            output2_scale_scalar=scale_c_fc2.data,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            n_group=num_expert_group,
+            topk_group=topk_group,
+            intermediate_size=self.intermediate_size_per_partition,
+                         local_expert_offset=self.ep_rank * self.num_local_experts,
+            local_num_experts=self.num_local_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            tile_tokens_dim=tile_tokens_dim,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
-        )
+        )[0]
 
         # Extract result from list if needed
         if isinstance(result, list):
