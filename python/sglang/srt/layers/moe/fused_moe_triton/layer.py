@@ -1,8 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import importlib.util
 import logging
 from enum import Enum
 from typing import List, Optional, Tuple
+import sys
 
 import torch
 
@@ -19,14 +21,52 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip, next_power_of_2
+from flashinfer import (
+    reorder_rows_for_gated_act_gemm,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
+    fp4_quantize,
+    RoutingMethodType,
+)
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
+use_flashinfer_trtllm_moe = (
+    global_server_args_dict["enable_flashinfer_trtllm_moe"]
+    and importlib.util.find_spec("flashinfer.fused_moe") is not None
+)
+
+# Try to import FP4 TRTLLM function if flashinfer is available
+trtllm_fp4_block_scale_moe = None
+if use_flashinfer_trtllm_moe:
+    try:
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+    except ImportError:
+        trtllm_fp4_block_scale_moe = None
+
 logger = logging.getLogger(__name__)
 
+
+def _is_fp4_quantization_enabled():
+    """Check if ModelOpt FP4 quantization is enabled."""
+    try:
+        # Use the same simple check that works for class selection
+        quantization = global_server_args_dict.get("quantization")
+        return quantization == "modelopt_fp4"
+    except:
+        return False
+
+def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+    return tile_tokens_dim
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -417,7 +457,7 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if getattr(self, "use_flashinfer_trtllm_moe", False):
+        if use_flashinfer_trtllm_moe:
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
@@ -574,6 +614,15 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.quant_method is not None
 
+        rank = get_tensor_model_parallel_rank()
+        print(f"RANK {rank}: === CUTLASS Forward ===")
+        print(f"RANK {rank}: Input: hidden_states max_abs={hidden_states.abs().max():.6f}")
+        print(f"RANK {rank}: MoE input sum = {float(hidden_states.abs().sum())}")
+        
+        # DEBUG: Key TopK info for comparison with TRTLLM
+        print(f"RANK {rank}: TopK: weights range=[{topk_output.topk_weights.min():.6f}, {topk_output.topk_weights.max():.6f}], experts=[{topk_output.topk_ids.min()}, {topk_output.topk_ids.max()}]")
+        print(f"RANK {rank}: Router logits range=[{topk_output.router_logits.min():.3f}, {topk_output.router_logits.max():.3f}]")
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -593,6 +642,12 @@ class FusedMoE(torch.nn.Module):
                 else {}
             ),
         )
+
+        print(f"RANK {rank}: CUTLASS Result: max_abs={final_hidden_states.abs().max():.6e}")
+
+        print(f"RANK {rank}: MoE CUTLASS output in fusedmoe", final_hidden_states)
+        
+        sys.exit(0)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -627,3 +682,232 @@ class FusedMoE(torch.nn.Module):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
+
+
+class FlashInferFP4MoE(FusedMoE):
+    """FP4 TRTLLM MoE implementation using FlashInfer."""
+
+
+
+    def __init__(self, *args, **kwargs):
+        # Extract DeepSeek-specific parameters
+        renormalize = kwargs.pop("renormalize", True)
+        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
+        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
+        num_expert_group = kwargs.pop("num_expert_group", None)
+        topk_group = kwargs.pop("topk_group", None)
+        correction_bias = kwargs.pop("correction_bias", None)
+
+        super().__init__(*args, **kwargs)
+
+        # Store DeepSeek parameters
+        self.renormalize = renormalize
+        self.num_fused_shared_experts = num_fused_shared_experts
+        self.use_grouped_topk = use_grouped_topk
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.correction_bias = correction_bias
+
+        # NOTE: Keep the TopK object - don't set to None!
+        # This preserves all the DeepSeek routing configuration
+
+        # Validation
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+
+
+
+    # ---------------------------------------------------------------------
+    # Helper: quantize hidden states to FP4 each forward pass
+    # ---------------------------------------------------------------------
+    def _quantize_hidden_states_fp4(self, hidden_states: torch.Tensor):
+        """
+        Quantize hidden states using global scale factor from quantization method.
+        
+        Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading.
+        Only block scales are computed at runtime for efficiency.
+        
+        Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, global_scale_float32)
+        """
+        # Get global scale factor and ensure it's on the correct device (lazy device transfer)
+        if hasattr(self, 'w13_input_scale_quant'):
+            global_sf_tensor = self.w13_input_scale_quant.to(hidden_states.device)
+        else:
+            raise RuntimeError("Missing w13_input_scale_quant. Ensure ModelOptNvFp4FusedMoEMethod processed weights.")
+
+        # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
+        # Only the block scales are computed at runtime
+        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+            hidden_states,
+            global_sf_tensor,
+            16,  # sf_vec_size  
+            False,  # use_ue8m0
+            False,   # is_sf_swizzled_layout
+        )
+
+        hs_fp4 = hs_fp4_bytes.reshape(hidden_states.shape[0], hidden_states.shape[1] // 2)
+        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
+        
+        return hs_fp4, hs_sf, global_sf_tensor
+
+    def forward(self, hidden_states: torch.Tensor, topk_output):
+        """Forward pass using FP4 TRTLLM kernel.
+        
+        Args:
+            hidden_states: Input tensor
+            topk_output: Should be tuple of (TopK_config, router_logits) for TRTLLM mode
+        """
+        # Weights are already preprocessed by ModelOptNvFp4FusedMoEMethod during model loading
+
+        rank = get_tensor_model_parallel_rank()
+        print(f"RANK {rank}: === TRTLLM Forward ===")
+        print(f"RANK {rank}: Input: hidden_states max_abs={hidden_states.abs().max():.6f}")
+        print(f"RANK {rank}: MoE input sum = {float(hidden_states.abs().sum())}")
+        
+        # TRTLLM mode expects (TopK_config, router_logits) tuple
+        if not isinstance(topk_output, tuple):
+            raise ValueError(f"FlashInferFP4MoE expects (TopK_config, router_logits) tuple, got {type(topk_output)}")
+            
+        topk_config, router_logits = topk_output
+        
+        # Extract DeepSeek parameters from TopK config
+        num_expert_group = topk_config.num_expert_group
+        topk_group = topk_config.topk_group
+        correction_bias = topk_config.correction_bias
+        routed_scaling_factor = topk_config.routed_scaling_factor
+        top_k = topk_config.top_k
+        
+        # Use the same grouped top-k processing as CUTLASS path for consistency
+        topk_weights, topk_ids, _ = topk_config(hidden_states, router_logits)
+        print(f"RANK {rank}: TopK: weights range=[{topk_weights.min():.6f}, {topk_weights.max():.6f}], experts=[{topk_ids.min()}, {topk_ids.max()}]")
+        print(f"RANK {rank}: Router logits range=[{router_logits.min():.3f}, {router_logits.max():.3f}]")
+
+        # Quantise hidden states to FP4 on-the-fly
+        hs_fp4, hs_scale_linear, _hidden_gsf = self._quantize_hidden_states_fp4(hidden_states)
+        
+        # Use pre-computed scale factors from ModelOptNvFp4FusedMoEMethod
+        if hasattr(self, 'g1_scale_c') and hasattr(self, 'g1_alphas') and hasattr(self, 'g2_alphas'):
+            scale_c_fc1 = self.g1_scale_c.to(torch.float32)
+            scale_gate_fc1 = self.g1_alphas.to(torch.float32) 
+            scale_c_fc2 = self.g2_alphas.to(torch.float32)
+        else:
+            raise RuntimeError("Missing pre-computed scale factors (g1_scale_c, g1_alphas, g2_alphas)")
+
+        # Calculate tile_tokens_dim based on current batch
+        num_tokens = hidden_states.shape[0]
+        tile_tokens_dim = _get_tile_tokens_dim(num_tokens, top_k, self.num_experts)
+
+        # Debug prints for trtllm_fp4_block_scale_moe arguments (with rank info)
+        rank = get_tensor_model_parallel_rank()
+        print(f"=== RANK {rank}: trtllm_fp4_block_scale_moe args (layer.py) ===")
+        
+        router_logits_f32 = router_logits.to(torch.float32)
+        router_flat = router_logits_f32.flatten()
+        print(f"RANK {rank} router_logits: shape={router_logits_f32.shape}, dtype={router_logits_f32.dtype}")
+        print(f"RANK {rank}   values: [{router_flat[:3].tolist()}...{router_flat[-3:].tolist()}]")
+        
+        correction_bias_typed = correction_bias.to(hidden_states.dtype)
+        correction_flat = correction_bias_typed.flatten()
+        print(f"RANK {rank} correction_bias: shape={correction_bias_typed.shape}, dtype={correction_bias_typed.dtype}")
+        print(f"RANK {rank}   values: [{correction_flat[:3].tolist()}...{correction_flat[-3:].tolist()}]")
+        
+        hs_fp4_flat = hs_fp4.flatten()
+        print(f"RANK {rank} hs_fp4: shape={hs_fp4.shape}, dtype={hs_fp4.dtype}")
+        print(f"RANK {rank}   values: [{hs_fp4_flat[:3].tolist()}...{hs_fp4_flat[-3:].tolist()}]")
+        
+        hs_scale_fp8 = hs_scale_linear.view(torch.float8_e4m3fn)
+        hs_scale_flat = hs_scale_fp8.flatten()
+        print(f"RANK {rank} hs_scale_linear: shape={hs_scale_fp8.shape}, dtype={hs_scale_fp8.dtype}")
+        print(f"RANK {rank}   values: [{hs_scale_flat[:3].tolist()}...{hs_scale_flat[-3:].tolist()}]")
+        
+        w13_flat = self.w13_weight_fp4_shuffled.flatten()
+        print(f"RANK {rank} w13_weight_fp4_shuffled: shape={self.w13_weight_fp4_shuffled.shape}, dtype={self.w13_weight_fp4_shuffled.dtype}")
+        print(f"RANK {rank}   values: [{w13_flat[:3].tolist()}...{w13_flat[-3:].tolist()}]")
+        
+        w13_scale_fp8 = self.w13_scale_fp4_shuffled.view(torch.float8_e4m3fn)
+        w13_scale_flat = w13_scale_fp8.flatten()
+        print(f"RANK {rank} w13_scale_fp4_shuffled: shape={w13_scale_fp8.shape}, dtype={w13_scale_fp8.dtype}")
+        print(f"RANK {rank}   values: [{w13_scale_flat[:3].tolist()}...{w13_scale_flat[-3:].tolist()}]")
+        
+        w2_flat = self.w2_weight_fp4_shuffled.flatten()
+        print(f"RANK {rank} w2_weight_fp4_shuffled: shape={self.w2_weight_fp4_shuffled.shape}, dtype={self.w2_weight_fp4_shuffled.dtype}")
+        print(f"RANK {rank}   values: [{w2_flat[:3].tolist()}...{w2_flat[-3:].tolist()}]")
+        
+        w2_scale_fp8 = self.w2_scale_fp4_shuffled.view(torch.float8_e4m3fn)
+        w2_scale_flat = w2_scale_fp8.flatten()
+        print(f"RANK {rank} w2_scale_fp4_shuffled: shape={w2_scale_fp8.shape}, dtype={w2_scale_fp8.dtype}")
+        print(f"RANK {rank}   values: [{w2_scale_flat[:3].tolist()}...{w2_scale_flat[-3:].tolist()}]")
+        
+        scale_c_fc1_flat = scale_c_fc1.data.flatten()
+        print(f"RANK {rank} scale_c_fc1: shape={scale_c_fc1.data.shape}, dtype={scale_c_fc1.data.dtype}")
+        print(f"RANK {rank}   values: [{scale_c_fc1_flat[:3].tolist()}...{scale_c_fc1_flat[-3:].tolist()}]")
+        
+        scale_gate_fc1_flat = scale_gate_fc1.data.flatten()
+        print(f"RANK {rank} scale_gate_fc1: shape={scale_gate_fc1.data.shape}, dtype={scale_gate_fc1.data.dtype}")
+        print(f"RANK {rank}   values: [{scale_gate_fc1_flat[:3].tolist()}...{scale_gate_fc1_flat[-3:].tolist()}]")
+        
+        scale_c_fc2_flat = scale_c_fc2.data.flatten()
+        print(f"RANK {rank} scale_c_fc2: shape={scale_c_fc2.data.shape}, dtype={scale_c_fc2.data.dtype}")
+        print(f"RANK {rank}   values: [{scale_c_fc2_flat[:3].tolist()}...{scale_c_fc2_flat[-3:].tolist()}]")
+        
+        print(f"RANK {rank} num_experts: {self.num_experts}")
+        print(f"RANK {rank} top_k: {top_k}")
+        print(f"RANK {rank} num_expert_group: {num_expert_group}")
+        print(f"RANK {rank} topk_group: {topk_group}")
+        print(f"RANK {rank} intermediate_size: {self.intermediate_size_per_partition}")
+        print(f"RANK {rank} local_expert_offset: 0")
+        print(f"RANK {rank} local_num_experts: {self.num_local_experts}")
+        print(f"RANK {rank} routed_scaling_factor: {routed_scaling_factor}")
+        print(f"RANK {rank} tile_tokens_dim: {tile_tokens_dim}")
+        print(f"RANK {rank} routing_method_type: {RoutingMethodType.DeepSeekV3}")
+        print(f"RANK {rank} do_finalize: True")
+        print(f"RANK {rank} ===============================================")
+
+        # Call FP4 TRTLLM kernel with proper DeepSeek parameters
+        result = trtllm_fp4_block_scale_moe(
+            router_logits.to(torch.float32),  # routing_logits
+            correction_bias.to(hidden_states.dtype),  # routing_bias
+            hs_fp4,  # hidden_states (FP4)
+            hs_scale_linear.view(torch.float8_e4m3fn),  # hidden_states_scale
+            self.w13_weight_fp4_shuffled,  # gemm1_weights
+            self.w13_scale_fp4_shuffled.view(torch.float8_e4m3fn),   # gemm1_scales
+            self.w2_weight_fp4_shuffled,   # gemm2_weights
+            self.w2_scale_fp4_shuffled.view(torch.float8_e4m3fn),    # gemm2_scales
+            scale_c_fc1.data,     # scale_c_fc1
+            scale_gate_fc1.data,  # scale_gate_fc1
+            scale_c_fc2.data,     # scale_c_fc2
+            self.num_experts,         # num_experts
+            top_k,                   # top_k
+            num_expert_group,        # n_groups
+            topk_group,              # topk_group
+            self.intermediate_size_per_partition,  # intermediate_size
+            0,                       # local_expert_offset
+            self.num_local_experts,  # local_num_experts
+            routed_scaling_factor,   # routed_scaling_factor
+            tile_tokens_dim,         # tile_tokens_dim
+            RoutingMethodType.DeepSeekV3,  # routing_method_type (DeepSeek)
+            do_finalize=True,
+        )
+
+        # Extract result from list if needed
+        if isinstance(result, list):
+            result = result[0] if len(result) > 0 else None
+        
+        if result is not None and hasattr(result, 'abs'):
+            print(f"RANK {rank}: TRTLLM Result: max_abs={result.abs().max():.6e}")
+        
+        print(f"RANK {rank}: MoE TRTLLM output in fusedmoe", result)
+        
+        sys.exit(0)
+
+        return result
+
+
+def get_fused_moe_impl_class():
+    """Factory function to get the appropriate FusedMoE implementation class."""
+    if (_is_fp4_quantization_enabled()
+        and trtllm_fp4_block_scale_moe is not None
+        and global_server_args_dict.get("enable_flashinfer_trtllm_moe", False)):
+        return FlashInferFP4MoE
+    else:
+        return FusedMoE

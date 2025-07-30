@@ -208,7 +208,9 @@ def prepare_extend_inputs_for_correctness_test(
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
+def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
@@ -287,6 +289,13 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    # Set deterministic behavior for reproducibility
+    if server_args.random_seed is not None:
+        import random
+        random.seed(server_args.random_seed)
+        np.random.seed(server_args.random_seed)
+        torch.manual_seed(server_args.random_seed)
+    
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -437,6 +446,13 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    # Set deterministic behavior for reproducibility
+    if server_args.random_seed is not None:
+        import random
+        random.seed(server_args.random_seed)
+        np.random.seed(server_args.random_seed)
+        torch.manual_seed(server_args.random_seed)
+    
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
@@ -450,7 +466,7 @@ def latency_test(
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0], bench_args.input_len[0], seed=server_args.random_seed
     )
 
     # Warm up
@@ -476,7 +492,7 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, seed=server_args.random_seed)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,

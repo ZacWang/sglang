@@ -318,7 +318,16 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
             if not use_flashinfer_trtllm_moe
-            else None
+            else TopK(  # Create TopK object for TRTLLM mode too (but won't be used for processing)
+                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                renormalize=config.norm_topk_prob,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         )
 
         self.experts = get_moe_impl_class()(
@@ -476,10 +485,16 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
-            if self.topk is not None:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            
+            # CUTLASS path: unchanged behavior - process router_logits through TopK
+            # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
+            if use_flashinfer_trtllm_moe:
+                # TRTLLM mode: pass configuration object + raw logits
+                kwargs["topk_output"] = (self.topk, router_logits)
             else:
-                kwargs["router_logits"] = router_logits
+                # CUTLASS mode: existing behavior - process logits through TopK
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+                
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -501,10 +516,16 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
-        if self.topk is not None:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+        
+        # CUTLASS path: unchanged behavior - process router_logits through TopK
+        # TRTLLM path: pass (topk_config, router_logits) tuple for internal processing
+        if use_flashinfer_trtllm_moe:
+            # TRTLLM mode: pass configuration object + raw logits
+            kwargs["topk_output"] = (self.topk, router_logits)
         else:
-            kwargs["router_logits"] = router_logits
+            # CUTLASS mode: existing behavior - process logits through TopK
+            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
@@ -2010,6 +2031,33 @@ class DeepseekV2Model(nn.Module):
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        
+        # Determine how many layers to create (for debugging purposes)
+        debug_max_layers = _get_debug_max_layers()
+        if debug_max_layers is not None:
+            # User explicitly set a layer limit
+            effective_num_layers = min(debug_max_layers, config.num_hidden_layers)
+        else:
+            # Check if user wants to debug with first MoE block only
+            debug_env = os.environ.get("SGLANG_DEBUG_FIRST_MOE_ONLY")
+            if debug_env and debug_env.lower() in ["1", "true", "yes"]:
+                first_moe_plus_one = _find_first_moe_layer_plus_one(config)
+                if first_moe_plus_one is not None:
+                    effective_num_layers = first_moe_plus_one
+                else:
+                    logging.getLogger(__name__).warning(
+                        "SGLANG_DEBUG_FIRST_MOE_ONLY set but no MoE layers found, loading all layers"
+                    )
+                    effective_num_layers = config.num_hidden_layers
+            else:
+                effective_num_layers = config.num_hidden_layers
+        
+        self.effective_num_layers = effective_num_layers
+        if effective_num_layers < config.num_hidden_layers:
+            logging.getLogger(__name__).warning(
+                f"DEBUG MODE: Creating only {effective_num_layers} layers out of {config.num_hidden_layers}"
+            )
+        
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -2019,7 +2067,8 @@ class DeepseekV2Model(nn.Module):
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
                 )
-                for layer_id in range(config.num_hidden_layers)
+                #for layer_id in range(config.num_hidden_layers)
+                for layer_id in range(effective_num_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2166,6 +2215,13 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
+        # Print hidden states before logits processing (limited prints)
+        if not hasattr(self, '_print_count'):
+            self._print_count = 0
+        if self._print_count < 3 and hidden_states.device.index == 0:  # Only from cuda:0, first 3 times
+            print(f"LOGITS_TENSOR_{self._print_count}: hidden_states={hidden_states}")
+            self._print_count += 1
+
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -2176,14 +2232,18 @@ class DeepseekV2ForCausalLM(nn.Module):
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
+            # Use effective number of layers (for debugging) instead of config num_hidden_layers
+            effective_num_layers = getattr(self.model, 'effective_num_layers', self.config.num_hidden_layers)
             if weight_names is None:
-                layer_ids = range(self.config.num_hidden_layers)
+                #layer_ids = range(self.config.num_hidden_layers)
+                layer_ids = range(effective_num_layers)
             else:
                 layer_ids = set()
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        if layer_id < self.config.num_hidden_layers:
+                        #if layer_id < self.config.num_hidden_layers:
+                        if layer_id < effective_num_layers:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -2470,6 +2530,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                 weight_names.append(name)
 
                 if not is_nextn:
+                    # Skip loading weights for layers beyond our effective layer limit (for debugging)
+                    if name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if len(name_list) >= 3:
+                            try:
+                                layer_id = int(name_list[2])
+                                if layer_id >= self.model.effective_num_layers:
+                                    logging.getLogger(__name__).debug(
+                                        f"DEBUG MODE: Skipping weight {name} for layer {layer_id} "
+                                        f"(only loading {self.model.effective_num_layers} layers)"
+                                    )
+                                    continue
+                            except (ValueError, IndexError):
+                                pass  # Not a layer weight, continue processing
+                    
                     if hasattr(self.config, "num_nextn_predict_layers"):
                         num_nextn_layers = self.config.num_nextn_predict_layers
                         if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -2653,3 +2728,49 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
+
+# Add environment variable for debugging: limit model to only load up to and including first MoE block
+def _get_debug_max_layers():
+    """Get the maximum number of layers to load for debugging purposes.
+    
+    Set SGLANG_DEBUG_MAX_LAYERS environment variable to limit the model.
+    For example: SGLANG_DEBUG_MAX_LAYERS=5 will load only layers 0-4.
+    """
+    debug_max = os.environ.get("SGLANG_DEBUG_MAX_LAYERS")
+    if debug_max is not None:
+        try:
+            max_layers = int(debug_max)
+            logging.getLogger(__name__).warning(
+                f"DEBUG MODE: Limiting model to {max_layers} layers (set SGLANG_DEBUG_MAX_LAYERS={max_layers})"
+            )
+            return max_layers
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                f"Invalid SGLANG_DEBUG_MAX_LAYERS value: {debug_max}, ignoring"
+            )
+    return None
+
+
+def _find_first_moe_layer_plus_one(config):
+    """Find the layer index after the first MoE layer for debugging purposes."""
+    if (config.n_routed_experts is None or 
+        not hasattr(config, 'first_k_dense_replace') or 
+        not hasattr(config, 'moe_layer_freq')):
+        return None
+    
+    # Find first MoE layer
+    first_moe_layer = None
+    for layer_id in range(config.num_hidden_layers):
+        if (layer_id >= config.first_k_dense_replace and 
+            layer_id % config.moe_layer_freq == 0):
+            first_moe_layer = layer_id
+            break
+    
+    if first_moe_layer is not None:
+        # Return one layer after the first MoE layer
+        result = first_moe_layer + 1
+        logging.getLogger(__name__).warning(
+            f"DEBUG MODE: Found first MoE layer at {first_moe_layer}, will load up to layer {result-1} (inclusive)"
+        )
+        return result
+    return None
