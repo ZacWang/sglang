@@ -25,7 +25,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import psutil
 import setproctitle
@@ -1490,19 +1490,19 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.enable_lora:
-            lora_set = set([req.lora_path for req in self.running_batch.reqs])
+        def exceeds_lora_batch_limit(self, reqs: Iterable[str]) -> bool:
+            lora_ids = {req.lora_path for req in reqs if req.lora_path}
+            if len(lora_ids) > self.max_loras_per_batch:
+                return True
+            num_pinned = (
+                self.tp_worker.worker.model_runner.lora_manager.get_pinned_lora_count()
+            )
+            return False
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.enable_lora
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
+            if self.enable_lora and self.exceeds_lora_batch_limit(
+                self.running_batch.reqs + adder.can_run_list + [req]
             ):
                 self.running_batch.batch_is_full = True
                 break

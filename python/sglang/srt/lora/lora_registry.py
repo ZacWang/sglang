@@ -28,14 +28,15 @@ class LoRARef:
     """
     Reference record for a LoRA model.
 
-    This object guarantees a unique ``lora_id`` and may include ``lora_name`` and ``lora_path``. The ID
-    eliminates conflicts from reused LoRA names or paths and can be used to generate deterministic cache
+    This object guarantees a unique ``lora_id`` and may include ``lora_name``, ``lora_path``, and ``pinned``.
+    The ID eliminates conflicts from reused LoRA names or paths and can be used to generate deterministic cache
     keys (e.g., radix cache).
     """
 
     lora_id: str = field(default_factory=lambda: uuid4().hex)
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
+    pinned: Optional[bool] = None
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -156,6 +157,20 @@ class LoRARegistry:
                 )
             else:
                 raise TypeError("lora_id must be either a string or a list of strings.")
+
+    async def count_pinned_adapters(self) -> int:
+        """
+        Counts the number of pinned LoRA adapters.
+        """
+        async with self._registry_lock.reader_lock:
+            return sum(1 for ref in self._registry.values() if ref.pinned)
+
+    async def count_adapters(self) -> int:
+        """
+        Counts the number of all loaded LoRA adapters.
+        """
+        async with self._registry_lock.reader_lock:
+            return len(self._registry)
 
     async def wait_for_unload(self, lora_id: str):
         """

@@ -144,6 +144,9 @@ class LoRAManager:
 
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
+
+            # update counters
+            self.num_pinned_adapters += bool(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -181,6 +184,7 @@ class LoRAManager:
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
+            self.num_pinned_adapters -= bool(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -197,7 +201,12 @@ class LoRAManager:
         # the current API schema and introducing a better request schema in the future (e.g., use `model_name`).
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(cur_uids, self.loras, self.lora_modules)
+        self.memory_pool.prepare_lora_batch(
+            cur_uids=cur_uids,
+            lora_adapters=self.loras,
+            lora_modules=self.lora_modules,
+            lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+        )
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -351,6 +360,7 @@ class LoRAManager:
             max_lora_rank is not None and target_modules is not None
         ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
+        self.num_pinned_adapters = 0
         self.init_lora_adapters(lora_paths)
         self.init_lora_shapes(
             max_lora_rank=max_lora_rank,
@@ -396,7 +406,7 @@ class LoRAManager:
             self.max_lora_rank = max_lora_rank
         else:
             self.max_lora_rank = max(
-                [x.hf_config["r"] for x in self.configs.values()],
+                [x.r for x in self.configs.values()],
                 default=0,
             )
 

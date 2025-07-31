@@ -2,6 +2,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
+from python.sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.distributed import divide
 from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.layers import BaseLayerWithLoRA
@@ -154,6 +155,7 @@ class LoRAMemoryPool:
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        lora_refs: Dict[str, LoRARef],
     ):
         def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):

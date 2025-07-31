@@ -1090,7 +1090,28 @@ class TokenizerManager:
             new_adapter = LoRARef(
                 lora_name=obj.lora_name,
                 lora_path=obj.lora_path,
+                pinned=obj.pinned,
             )
+
+            # Ensure pinned LoRA adapters does not cause starvation.
+            if obj.pinned:
+                num_pinned = await self.lora_registry.count_pinned_adapters()
+                remaining_quota = self.server_args.max_loras_per_batch - num_pinned
+                if remaining_quota <= 0:
+                    raise ValueError(
+                        f"Cannot load pinned LoRA adapter {obj.lora_name} as the maximum number of pinned LoRA adapters "
+                        f"({self.server_args.max_loras_per_batch}) is reached. Please unload some pinned LoRA adapters or "
+                        f"load {obj.lora_name} as an unpinned adapter."
+                    )
+                elif remaining_quota == 1:
+                    num_adapters = await self.lora_registry.count_adapters()
+                    unpinned_adapters = num_adapters - num_pinned
+                    if unpinned_adapters > 0:
+                        raise ValueError(
+                            f"Cannot load pinned LoRA adapter {obj.lora_name} as this would use up all slots in "
+                            f"max_loras_per_batch, while there are still {unpinned_adapters} unpinned LoRA adapters "
+                            f"loaded. Please unload some adapters or load {obj.lora_name} as an unpinned adapter."
+                        )
 
             # Trigger the actual loading operation at the backend processes.
             obj.lora_id = new_adapter.lora_id
